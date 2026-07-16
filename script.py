@@ -349,11 +349,13 @@ def placeholder_prefixes(ordinal, prefix):
     return [f"{ordinal} {prefix}-", f"{ordinal}_{prefix}"]
 
 
-def resolve_cell_if_match(get_cell_str, set_cell, ordinal, prefix, team_code, location_desc):
+def resolve_cell_if_match(get_cell_str, set_cell, ordinal, prefix, team_code, location_desc, verbose=True):
     """Checks one cell against both known placeholder conventions (raw or
     already-resolved) and overwrites it with the current correct team name
     if it matches and differs from what's already there. Returns True if it
-    wrote a change."""
+    wrote a change. verbose=False suppresses the print (used on the Sheets
+    side, since the live Excel side already prints the same result and we
+    don't want every pool logged twice)."""
     team_name = team_display_name(team_code)
     cell_str = get_cell_str()
 
@@ -363,14 +365,15 @@ def resolve_cell_if_match(get_cell_str, set_cell, ordinal, prefix, team_code, lo
             new_value = f"{raw_prefix}{separator}{team_name}"
             if cell_str != new_value:
                 set_cell(new_value)
-                verb = "Resolved" if cell_str == raw_prefix else "Updated (correction)"
-                print(f"  {verb} '{cell_str}' -> '{new_value}' at {location_desc}")
+                if verbose:
+                    verb = "Resolved" if cell_str == raw_prefix else "Updated (correction)"
+                    print(f"  {verb} '{cell_str}' -> '{new_value}' at {location_desc}")
                 return True
             return False
     return False
 
 
-def reset_stale_placeholders(values, prefix, set_cell, location_desc_fn):
+def reset_stale_placeholders(values, prefix, set_cell, location_desc_fn, verbose=True):
     """If a pool that was previously fully scored and resolved becomes
     incomplete again (a score got erased, a game row got deleted, etc.),
     any cell for this pool's placeholders that currently shows a resolved
@@ -378,7 +381,9 @@ def reset_stale_placeholders(values, prefix, set_cell, location_desc_fn):
     '1st pt_U-BULLDOG' -> '1st pt_U-') instead of silently keeping a stale
     answer that no longer reflects reality now that the pool is undecided
     again. Scans all three ranks against both known placeholder
-    conventions. Returns True if it reset anything."""
+    conventions. Returns True if it reset anything. verbose=False
+    suppresses the print (Sheets side runs silently, same reasoning as
+    resolve_cell_if_match)."""
     changed = False
     for rank_num in (1, 2, 3):
         ordinal = ORDINALS[rank_num]
@@ -390,8 +395,9 @@ def reset_stale_placeholders(values, prefix, set_cell, location_desc_fn):
                 for raw in raw_forms:
                     if cell_str.startswith(raw) and cell_str != raw:
                         set_cell(r_idx, c_idx, raw)
-                        print(f"  Reset stale '{cell_str}' -> '{raw}' at {location_desc_fn(r_idx, c_idx)} "
-                              f"(pool '{prefix}' no longer fully scored)")
+                        if verbose:
+                            print(f"  Reset stale '{cell_str}' -> '{raw}' at {location_desc_fn(r_idx, c_idx)} "
+                                  f"(pool '{prefix}' no longer fully scored)")
                         changed = True
                         break
     return changed
@@ -587,7 +593,7 @@ def run_tiebreaker_live_xw(excel_file, busy_retries=3, busy_delay=1.5):
 
                     try:
                         result = compute_three_team_standings(games)
-                        print(f"[XLWINGS] Tiebreaker computed for pool '{prefix}' in tab '{ws.name}'")
+                        print(f"excel computed for pool '{prefix}' in tab '{ws.name}'")
                         resolve_downstream_placeholders_xw(ws, values, prefix, result)
                         any_processed = True
                     except Exception as e:
@@ -686,7 +692,7 @@ def run_tiebreaker_for_spreadsheet(sheets_service, spreadsheet_id):
 
             try:
                 result = compute_three_team_standings(games)
-                print(f"Tiebreaker computed for pool '{prefix}' in tab '{tab}'")
+                print(f"Sheets computed for pool '{prefix}' in tab '{tab}'")
                 queue_downstream_placeholder_writes(pending_writes, tab, values, prefix, result)
             except Exception as e:
                 print(f"Error computing tiebreaker for pool '{prefix}': {e}")
@@ -719,7 +725,7 @@ def watch(config, drive_service, sheets_service):
         # file misses the live edit until this succeeds on a later save.
         run_tiebreaker_live_xw(excel_file)
 
-        print("FINISHED")
+        print(f"FINISHED {config['count']}")
         print("-" * 40)
         return file_id
 
