@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import threading
 import datetime as dt
+import hashlib
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -22,7 +23,6 @@ CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
 WATCHES = [
     {
         "excel": os.path.join(BASE_DIR, "2026NJOCOPY.xlsx"),
-        "live_copy": os.path.join(BASE_DIR, "2026NJOCOPY_LIVE.xlsx"),
         "sheet": "2026njo",
         "count": 0
     }
@@ -33,7 +33,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-STANDINGS_TAB = "Standings"
 ORDINALS = {1: "1st", 2: "2nd", 3: "3rd"}
 
 
@@ -41,8 +40,6 @@ ORDINALS = {1: "1st", 2: "2nd", 3: "3rd"}
 # Upload logic
 # ============================================================================
 def upload_to_drive(drive_service, excel_file, sheet_name, count):
-    print(f"Change detected in {os.path.basename(excel_file)}! Uploading to '{sheet_name}'...")
-
     results = drive_service.files().list(
         q=f"name='{sheet_name}' and mimeType='application/vnd.google-apps.spreadsheet'",
         fields="files(id, name)",
@@ -84,8 +81,7 @@ def upload_to_drive(drive_service, excel_file, sheet_name, count):
         except Exception:
             continue
 
-    print(f"Upload complete! '{sheet_name}' updated with formatting. | ##: {count}")
-    print("-" * 40)
+    print(f"Sheets uploaded to '{sheet_name}'")
 
     return file_id
 
@@ -210,6 +206,24 @@ def compute_three_team_standings(games):
         w_int, d_int = int(w_score // 1), int(d_score // 1)
         w_dec, d_dec = w_score - w_int, d_score - d_int
 
+        # The decimal (e.g. .3 in "10.3") is a shootout marker, not a
+        # fractional goal -- .3 means "won the shootout by 3". Below, the
+        # RAW w_dec/d_dec still decide who won the shootout for points
+        # purposes (3/2 split) and for head-to-head comparisons -- that
+        # logic is unchanged. What's new: the shootout digit also gets
+        # added to the regulation goal count to form a combined goal total,
+        # and THAT total (not just the regulation score) is what feeds
+        # Goals Scored / Goals Allowed / Goal Differential. Previously a
+        # shootout win added nothing to GS/GA/GD, which meant an all-
+        # shootout pool could never be separated by GD at all (everyone's
+        # combined GD was still 0-0-0, exactly like a plain tie) -- now a
+        # shootout win shows up in the goal totals the same way a
+        # regulation goal would.
+        w_shootout_goals = round(w_dec * 10)
+        d_shootout_goals = round(d_dec * 10)
+        w_total = w_int + w_shootout_goals
+        d_total = d_int + d_shootout_goals
+
         if w_int > d_int:
             w_pts, d_pts = 4, 1
         elif d_int > w_int:
@@ -223,11 +237,15 @@ def compute_three_team_standings(games):
 
         teams[g["white"]]["pts"] += w_pts
         teams[g["dark"]]["pts"] += d_pts
-        teams[g["white"]]["gs"] += w_int
-        teams[g["white"]]["ga"] += d_int
-        teams[g["dark"]]["gs"] += d_int
-        teams[g["dark"]]["ga"] += w_int
+        teams[g["white"]]["gs"] += w_total
+        teams[g["white"]]["ga"] += d_total
+        teams[g["dark"]]["gs"] += d_total
+        teams[g["dark"]]["ga"] += w_total
 
+        # Head-to-head comparisons stay based on the original regulation
+        # score + shootout decimal -- this is about who literally won that
+        # specific game (same rule as points: regulation decides, shootout
+        # decimal breaks a regulation tie), not about goal totals.
         h2h[(g["white"], g["dark"])] = {"a": w_int, "b": d_int, "a_dec": w_dec, "b_dec": d_dec}
         h2h[(g["dark"], g["white"])] = {"a": d_int, "b": w_int, "a_dec": d_dec, "b_dec": w_dec}
 
@@ -316,16 +334,67 @@ def colnum_to_letter(n):
     return letters
 
 
-def placeholder_candidates(ordinal, prefix, team_code):
+def placeholder_prefixes(ordinal, prefix):
     """Two known conventions seen across tabs:
-    - space+dash:  '1st pt_O-'  -> '1st pt_O-TEAM NAME'  (most tabs)
-    - underscore:  '1st_pt_O'   -> '1st_pt_O-TEAM NAME'  (e.g. 12U_Coed_Champ-45)
-    Returns {raw_placeholder_text: resolved_value}."""
+    - space+dash:  '1st pt_O-'  (most tabs)
+    - underscore:  '1st_pt_O'   (e.g. 12U_Coed_Champ-45)
+    Returns the raw prefix strings to check a cell against via startswith --
+    NOT exact match. This matters: once a placeholder gets resolved (e.g.
+    '1st pt_O-' becomes '1st pt_O-DIABLO ALLIANCE B'), the cell no longer
+    equals the raw unresolved text. If a later score correction changes who
+    should actually be 1st, matching only the raw text would silently skip
+    that cell forever, leaving the WRONG team advanced with no error. This
+    version recognizes the cell whether it's still raw or already resolved
+    with some (possibly now-stale) team name, so corrections can overwrite it."""
+    return [f"{ordinal} {prefix}-", f"{ordinal}_{prefix}"]
+
+
+def resolve_cell_if_match(get_cell_str, set_cell, ordinal, prefix, team_code, location_desc):
+    """Checks one cell against both known placeholder conventions (raw or
+    already-resolved) and overwrites it with the current correct team name
+    if it matches and differs from what's already there. Returns True if it
+    wrote a change."""
     team_name = team_display_name(team_code)
-    return {
-        f"{ordinal} {prefix}-": f"{ordinal} {prefix}-{team_name}",
-        f"{ordinal}_{prefix}": f"{ordinal}_{prefix}-{team_name}",
-    }
+    cell_str = get_cell_str()
+
+    for raw_prefix in placeholder_prefixes(ordinal, prefix):
+        if cell_str == raw_prefix or cell_str.startswith(raw_prefix):
+            separator = "" if raw_prefix.endswith("-") else "-"
+            new_value = f"{raw_prefix}{separator}{team_name}"
+            if cell_str != new_value:
+                set_cell(new_value)
+                verb = "Resolved" if cell_str == raw_prefix else "Updated (correction)"
+                print(f"  {verb} '{cell_str}' -> '{new_value}' at {location_desc}")
+                return True
+            return False
+    return False
+
+
+def reset_stale_placeholders(values, prefix, set_cell, location_desc_fn):
+    """If a pool that was previously fully scored and resolved becomes
+    incomplete again (a score got erased, a game row got deleted, etc.),
+    any cell for this pool's placeholders that currently shows a resolved
+    team name gets reset back to its raw, unresolved form (e.g.
+    '1st pt_U-BULLDOG' -> '1st pt_U-') instead of silently keeping a stale
+    answer that no longer reflects reality now that the pool is undecided
+    again. Scans all three ranks against both known placeholder
+    conventions. Returns True if it reset anything."""
+    changed = False
+    for rank_num in (1, 2, 3):
+        ordinal = ORDINALS[rank_num]
+        raw_forms = placeholder_prefixes(ordinal, prefix)
+
+        for r_idx, row in enumerate(values):
+            for c_idx, cell in enumerate(row):
+                cell_str = str(cell).strip() if cell is not None else ""
+                for raw in raw_forms:
+                    if cell_str.startswith(raw) and cell_str != raw:
+                        set_cell(r_idx, c_idx, raw)
+                        print(f"  Reset stale '{cell_str}' -> '{raw}' at {location_desc_fn(r_idx, c_idx)} "
+                              f"(pool '{prefix}' no longer fully scored)")
+                        changed = True
+                        break
+    return changed
 
 
 # ============================================================================
@@ -337,22 +406,39 @@ def placeholder_candidates(ordinal, prefix, team_code):
 # Excel instance, xlwings attaches to that exact session (Excel still owns
 # the file, so there's no lock conflict). If it's not open, xlwings opens it
 # fresh. Either way we get a live handle to work with directly.
-def get_live_workbook(excel_file):
+def get_live_workbook(excel_file, quiet=False):
     if not XLWINGS_AVAILABLE:
-        print("[XLWINGS] xlwings not installed -- run: pip install xlwings")
+        if not quiet:
+            print("[XLWINGS] xlwings not installed -- run: pip install xlwings")
         return None
     try:
         return xw.Book(excel_file)
     except Exception as e:
-        print(f"[XLWINGS] Could not attach to workbook: {e}")
+        if not quiet:
+            print(f"[XLWINGS] Could not attach to workbook: {e}")
         return None
 
 
+FIXED_READ_RANGE = "A1:Z475"
+
+
 def read_sheet_values_xw(sht):
-    """Normalizes xlwings' used_range.value (which can come back as a
-    scalar, a flat list, or a list of lists depending on the range's shape)
-    into a consistent list-of-rows shape, matching what find_pools() expects."""
-    raw = sht.used_range.value
+    """Normalizes xlwings' range values (which can come back as a scalar, a
+    flat list, or a list of lists depending on the range's shape) into a
+    consistent list-of-rows shape, matching what find_pools() expects.
+
+    Deliberately reads a fixed, generously-sized range (A1:Z600) instead of
+    sht.used_range. Excel's UsedRange is a tracked boundary that can lag
+    behind very recent edits, especially edits near the current edge of
+    that boundary -- a score typed seconds ago can be genuinely on the
+    sheet but not yet reflected in used_range, until Excel recalculates it
+    (e.g. on a full close/reopen). That caused exactly the symptom seen
+    live: a newly-completed pool would resolve correctly moments later via
+    the Sheets-side path (which re-reads the whole uploaded file fresh) but
+    get silently missed by the live xlwings path THIS cycle. Reading a
+    fixed range sidesteps the staleness entirely -- extra blank cells
+    beyond your real data are harmless, find_pools() already ignores them."""
+    raw = sht.range(FIXED_READ_RANGE).value
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -362,39 +448,48 @@ def read_sheet_values_xw(sht):
     return raw
 
 
-def ensure_standings_sheet_xw(wb):
-    names = [s.name for s in wb.sheets]
-    if STANDINGS_TAB in names:
-        return wb.sheets[STANDINGS_TAB]
-    ws = wb.sheets.add(name=STANDINGS_TAB, after=wb.sheets[-1])
-    ws.range((1, 1)).value = [["Pool", "1st", "2nd", "3rd", "Narrative", "Last Updated"]]
-    return ws
+def compute_data_signature(excel_file, busy_retries=2, busy_delay=1.0):
+    """Returns a signature representing the actual game data (White/Dark/
+    score cells across all sheets), NOT raw file bytes and NOT mtime. This
+    matters because Excel's AutoSave (on by default for OneDrive files) or
+    OneDrive's own sync process periodically re-saves the file in the
+    background even when no score actually changed -- every save updates
+    internal file metadata (an embedded 'last modified' timestamp inside
+    the .xlsx itself), which changes the mtime AND the raw file bytes even
+    with zero real data change. Comparing actual cell values instead means
+    background autosave/sync churn no longer falsely triggers a new
+    auto-advance cycle.
 
+    A transient "Excel is busy" moment (same OLE error as elsewhere) is
+    retried briefly rather than immediately falling back to a raw file-byte
+    hash -- switching signature methods between calls would itself look
+    like a false "change" even when nothing in the data actually moved,
+    since a value-hash and a file-byte-hash of the same data never match.
 
-def write_standings_row_xw(standings_ws, prefix, result):
-    target_row = None
-    r = 1
-    while standings_ws.range((r, 1)).value not in (None, ""):
-        if standings_ws.range((r, 1)).value == prefix:
-            target_row = r
-            break
-        r += 1
-    if target_row is None:
-        target_row = r
+    Falls back to hashing raw file bytes only if xlwings truly isn't
+    available/attached after retries."""
+    for attempt in range(busy_retries):
+        wb = get_live_workbook(excel_file, quiet=True)
+        if wb is not None:
+            try:
+                parts = []
+                for ws in wb.sheets:
+                    parts.append(f"{ws.name}:{read_sheet_values_xw(ws)}")
+                return hashlib.md5("".join(parts).encode("utf-8", errors="ignore")).hexdigest()
+            except Exception as e:
+                if _is_excel_busy_error(e) and attempt < busy_retries - 1:
+                    time.sleep(busy_delay)
+                    continue
+                break  # not a busy error, or out of retries -- fall through to file-hash
+        else:
+            break  # xlwings not available/attached at all -- no point retrying
 
-    if result["true_tie"]:
-        row_values = [prefix, "TRUE TIE", "TRUE TIE", "TRUE TIE", result["narrative"],
-                      time.strftime("%Y-%m-%d %H:%M:%S")]
-    else:
-        row_values = [
-            prefix,
-            team_display_name(result["rank"][1]),
-            team_display_name(result["rank"][2]),
-            team_display_name(result["rank"][3]),
-            result["narrative"],
-            time.strftime("%Y-%m-%d %H:%M:%S")
-        ]
-    standings_ws.range((target_row, 1)).value = [row_values]
+    try:
+        with open(excel_file, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except Exception:
+        return None
+
 
 
 def resolve_downstream_placeholders_xw(ws, values, prefix, result):
@@ -403,101 +498,114 @@ def resolve_downstream_placeholders_xw(ws, values, prefix, result):
 
     for rank_num, team_code in result["rank"].items():
         ordinal = ORDINALS[rank_num]
-        candidates = placeholder_candidates(ordinal, prefix, team_code)
 
         for r_idx, row in enumerate(values):
             for c_idx, cell in enumerate(row):
                 cell_str = str(cell).strip() if cell is not None else ""
-                if cell_str in candidates:
-                    new_value = candidates[cell_str]
-                    ws.range((r_idx + 1, c_idx + 1)).value = new_value
-                    print(f"  [XLWINGS] Resolved '{cell_str}' -> '{new_value}' "
-                          f"at row {r_idx + 1}, col {c_idx + 1} in '{ws.name}'")
+
+                def get_str(s=cell_str):
+                    return s
+
+                def set_val(v, r=r_idx, c=c_idx):
+                    ws.range((r + 1, c + 1)).value = v
+
+                resolve_cell_if_match(
+                    get_cell_str=get_str,
+                    set_cell=set_val,
+                    ordinal=ordinal, prefix=prefix, team_code=team_code,
+                    location_desc=f"[XLWINGS] row {r_idx + 1}, col {c_idx + 1} in '{ws.name}'"
+                )
 
 
-def run_tiebreaker_live_xw(excel_file):
+EXCEL_BUSY_HRESULT = -2146777998  # 0x800AC472 -- "Excel is busy right now, try again"
+
+
+def _is_excel_busy_error(exc):
+    return bool(exc.args) and isinstance(exc.args[0], int) and exc.args[0] == EXCEL_BUSY_HRESULT
+
+
+_last_tab_signature = {}  # {(excel_file, tab_name): hash} -- persists across calls
+                          # within this process, so unchanged tabs get skipped
+
+
+def _hash_tab_values(values):
+    return hashlib.md5(str(values).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def run_tiebreaker_live_xw(excel_file, busy_retries=3, busy_delay=1.5):
     """Attempts to run the full tiebreaker + auto-advance pass live, directly
     against your already-open Excel workbook via xlwings. Returns True if it
     ran (and saved), False if xlwings isn't available or something went
-    wrong attaching (caller should fall back to the duplicate-file approach)."""
-    wb = get_live_workbook(excel_file)
-    if wb is None:
-        return False
+    wrong attaching (caller should fall back to the duplicate-file approach).
 
-    try:
-        standings_ws = ensure_standings_sheet_xw(wb)
+    Excel occasionally rejects an incoming automation call with OLE error
+    0x800AC472 -- this specifically means "I'm busy right now" (mid-save,
+    mid-recalculation, a cell still in edit mode, etc.), not a real failure.
+    It usually clears within a second or two, so this retries a few times
+    on that specific error before giving up and falling back.
 
-        for ws in wb.sheets:
-            if ws.name == STANDINGS_TAB:
-                continue
+    Also skips any tab whose actual data hasn't changed since the last run
+    (tracked via _last_tab_signature) -- previously every tab got fully
+    re-read and re-scanned on every single save, even ones untouched since
+    the last change. Now only the tab(s) that actually changed get
+    reprocessed, which matters more the more tabs/divisions a workbook has."""
+    for attempt in range(busy_retries):
+        wb = get_live_workbook(excel_file, quiet=(attempt > 0))
+        if wb is None:
+            return False
 
-            values = read_sheet_values_xw(ws)
-            pools = find_pools(values)
-
-            for prefix, games in pools.items():
-                if len(games) != 3:
-                    continue
-                all_scored = all(
-                    g["white_score"] not in ("", None) and g["dark_score"] not in ("", None)
-                    for g in games
-                )
-                if not all_scored:
-                    continue
-
-                try:
-                    result = compute_three_team_standings(games)
-                    write_standings_row_xw(standings_ws, prefix, result)
-                    print(f"[XLWINGS] Tiebreaker computed for pool '{prefix}' in tab '{ws.name}'")
-                    resolve_downstream_placeholders_xw(ws, values, prefix, result)
-                except Exception as e:
-                    print(f"[XLWINGS] Error computing tiebreaker for pool '{prefix}' in '{ws.name}': {e}")
-
-        wb.save()
-        print("[XLWINGS] Auto-advance applied live to the open workbook.")
-        return True
-    except Exception as e:
-        print(f"[XLWINGS] Unexpected error during live auto-advance: {e}")
-        return False
-
-
-# ============================================================================
-# LIVE DUPLICATE: write auto-advance results into a separate file, never
-# touching the file you actually have open in Excel
-# ============================================================================
-# Excel holds an exclusive lock on your working file for as long as it's
-# open -- there's no reliable way for another process to write into that
-# same file without you closing it first. Rather than fight that lock,
-# auto-advance results get written into a SEPARATE file sitting next to your
-# working copy (e.g. "2026NJOCOPY_LIVE.xlsx"). That duplicate is never
-# opened by Excel, so nothing ever locks it -- writes to it always succeed.
-#
-# Flow: you edit scores in your working file -> script uploads a read-only
-# copy to Drive (this already works fine while the file is open) -> Google
-# Sheets computes the tiebreaker/auto-advance -> the finished result gets
-# exported and saved as the live-copy file. Open the live-copy file anytime
-# to see current standings and resolved bracket placeholders, side by side
-# with your working file.
-def download_sheet_as_excel(drive_service, spreadsheet_id, live_copy_path, attempts=5, delay=2):
-    request = drive_service.files().export_media(
-        fileId=spreadsheet_id,
-        mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
-    data = request.execute()
-
-    for attempt in range(attempts):
         try:
-            with open(live_copy_path, "wb") as f:
-                f.write(data)
-            print(f"[LIVE COPY] Updated '{os.path.basename(live_copy_path)}' with auto-advance results.")
-            return True
-        except PermissionError:
-            # only happens if you have the live-copy file itself open somewhere
-            print(f"[LIVE COPY] '{os.path.basename(live_copy_path)}' is locked "
-                  f"(attempt {attempt + 1}/{attempts}), retrying in {delay}s...")
-            time.sleep(delay)
+            any_processed = False
 
-    print(f"[LIVE COPY] Could not write '{os.path.basename(live_copy_path)}' -- "
-          "close it if you have it open, and it'll catch up on the next change.")
+            for ws in wb.sheets:
+                values = read_sheet_values_xw(ws)
+
+                tab_key = (excel_file, ws.name)
+                tab_hash = _hash_tab_values(values)
+                if _last_tab_signature.get(tab_key) == tab_hash:
+                    continue  # nothing changed on this tab since last run
+                _last_tab_signature[tab_key] = tab_hash
+
+                pools = find_pools(values)
+
+                for prefix, games in pools.items():
+                    is_complete = len(games) == 3 and all(
+                        g["white_score"] not in ("", None) and g["dark_score"] not in ("", None)
+                        for g in games
+                    )
+
+                    if not is_complete:
+                        def set_cell_xw(r, c, v, ws=ws):
+                            ws.range((r + 1, c + 1)).value = v
+
+                        def loc_xw(r, c, ws=ws):
+                            return f"row {r + 1}, col {c + 1} in '{ws.name}'"
+
+                        if reset_stale_placeholders(values, prefix, set_cell_xw, loc_xw):
+                            any_processed = True
+                        continue
+
+                    try:
+                        result = compute_three_team_standings(games)
+                        print(f"[XLWINGS] Tiebreaker computed for pool '{prefix}' in tab '{ws.name}'")
+                        resolve_downstream_placeholders_xw(ws, values, prefix, result)
+                        any_processed = True
+                    except Exception as e:
+                        print(f"[XLWINGS] Error computing tiebreaker for pool '{prefix}' in '{ws.name}': {e}")
+
+            if any_processed:
+                wb.save()
+                print("[XLWINGS] Auto-advance applied live to the open workbook.")
+            return True
+        except Exception as e:
+            if _is_excel_busy_error(e) and attempt < busy_retries - 1:
+                print(f"[XLWINGS] Excel is momentarily busy, retrying in {busy_delay}s... "
+                      f"(attempt {attempt + 1}/{busy_retries})")
+                time.sleep(busy_delay)
+                continue
+            print(f"[XLWINGS] Unexpected error during live auto-advance: {e}")
+            return False
+
     return False
 
 
@@ -505,106 +613,89 @@ def download_sheet_as_excel(drive_service, spreadsheet_id, live_copy_path, attem
 # ============================================================================
 # GOOGLE SHEETS: same tiebreaker pass, applied to the uploaded copy
 # ============================================================================
-def ensure_standings_sheet_exists(sheets_service, spreadsheet_id):
-    meta = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    tab_names = [s["properties"]["title"] for s in meta["sheets"]]
 
-    if STANDINGS_TAB not in tab_names:
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"requests": [{"addSheet": {"properties": {"title": STANDINGS_TAB}}}]}
-        ).execute()
-        sheets_service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{STANDINGS_TAB}!A1",
-            valueInputOption="RAW",
-            body={"values": [["Pool", "1st", "2nd", "3rd", "Narrative", "Last Updated"]]}
-        ).execute()
-
-
-def write_standings_row(sheets_service, spreadsheet_id, prefix, result):
-    existing = sheets_service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id, range=f"{STANDINGS_TAB}!A:A"
-    ).execute().get("values", [])
-
-    target_row = None
-    for i, row in enumerate(existing):
-        if row and row[0] == prefix:
-            target_row = i + 1
-            break
-    if target_row is None:
-        target_row = len(existing) + 1
-
+def queue_downstream_placeholder_writes(pending_writes, tab, values, prefix, result):
+    """Same matching logic as resolve_cell_if_match, but queues the write
+    into pending_writes instead of executing an API call immediately --
+    lets run_tiebreaker_for_spreadsheet send every cell write from an
+    entire run in a single batchUpdate instead of one call per cell."""
     if result["true_tie"]:
-        row_values = [prefix, "TRUE TIE", "TRUE TIE", "TRUE TIE", result["narrative"], time.strftime("%Y-%m-%d %H:%M:%S")]
-    else:
-        row_values = [
-            prefix,
-            team_display_name(result["rank"][1]),
-            team_display_name(result["rank"][2]),
-            team_display_name(result["rank"][3]),
-            result["narrative"],
-            time.strftime("%Y-%m-%d %H:%M:%S")
-        ]
-
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=f"{STANDINGS_TAB}!A{target_row}",
-        valueInputOption="RAW",
-        body={"values": [row_values]}
-    ).execute()
-
-
-def resolve_downstream_placeholders(sheets_service, spreadsheet_id, tab, values, prefix, result):
-    if result["true_tie"]:
-        return  # nothing to resolve -- can't advance a true tie automatically
+        return
 
     for rank_num, team_code in result["rank"].items():
         ordinal = ORDINALS[rank_num]
-        candidates = placeholder_candidates(ordinal, prefix, team_code)
 
         for r_idx, row in enumerate(values):
             for c_idx, cell in enumerate(row):
                 cell_str = str(cell).strip()
-                if cell_str in candidates:
-                    new_value = candidates[cell_str]
-                    cell_range = f"{tab}!{colnum_to_letter(c_idx + 1)}{r_idx + 1}"
-                    sheets_service.spreadsheets().values().update(
-                        spreadsheetId=spreadsheet_id,
-                        range=cell_range,
-                        valueInputOption="RAW",
-                        body={"values": [[new_value]]}
-                    ).execute()
-                    print(f"  Resolved '{cell_str}' -> '{new_value}' at {cell_range}")
+                cell_range = f"{tab}!{colnum_to_letter(c_idx + 1)}{r_idx + 1}"
+
+                def get_str(s=cell_str):
+                    return s
+
+                def set_val(v, rng=cell_range):
+                    pending_writes.append({"range": rng, "values": [[v]]})
+
+                resolve_cell_if_match(
+                    get_cell_str=get_str,
+                    set_cell=set_val,
+                    ordinal=ordinal, prefix=prefix, team_code=team_code,
+                    location_desc=cell_range
+                )
 
 
 def run_tiebreaker_for_spreadsheet(sheets_service, spreadsheet_id):
+    """Runs the tiebreaker pass across every tab, batching all reads and
+    writes into as few Sheets API calls as possible -- each individual API
+    call is a full network round trip, and the old per-cell approach could
+    add up to dozens of sequential round trips per run. Now it's: one call
+    to list tabs, one batched read of every tab's data, and one batched
+    write for every resolved placeholder cell computed this run."""
     meta = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    tab_names = [s["properties"]["title"] for s in meta["sheets"] if s["properties"]["title"] != STANDINGS_TAB]
+    tab_names = [s["properties"]["title"] for s in meta["sheets"]]
 
-    ensure_standings_sheet_exists(sheets_service, spreadsheet_id)
+    # One batched read for every tab's data, instead of one GET per tab.
+    batch_get = sheets_service.spreadsheets().values().batchGet(
+        spreadsheetId=spreadsheet_id, ranges=tab_names
+    ).execute()
+    tab_values = {
+        tab_names[i]: vr.get("values", [])
+        for i, vr in enumerate(batch_get.get("valueRanges", []))
+    }
+
+    pending_writes = []
 
     for tab in tab_names:
-        values = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=tab
-        ).execute().get("values", [])
-
+        values = tab_values.get(tab, [])
         pools = find_pools(values)
 
         for prefix, games in pools.items():
-            if len(games) != 3:
-                continue
-            all_scored = all(g["white_score"] not in ("", None) and g["dark_score"] not in ("", None) for g in games)
-            if not all_scored:
+            is_complete = len(games) == 3 and all(
+                g["white_score"] not in ("", None) and g["dark_score"] not in ("", None) for g in games
+            )
+
+            if not is_complete:
+                def set_cell_sheets(r, c, v, tab=tab):
+                    pending_writes.append({"range": f"{tab}!{colnum_to_letter(c + 1)}{r + 1}", "values": [[v]]})
+
+                def loc_sheets(r, c, tab=tab):
+                    return f"{tab}!{colnum_to_letter(c + 1)}{r + 1}"
+
+                reset_stale_placeholders(values, prefix, set_cell_sheets, loc_sheets)
                 continue
 
             try:
                 result = compute_three_team_standings(games)
-                write_standings_row(sheets_service, spreadsheet_id, prefix, result)
                 print(f"Tiebreaker computed for pool '{prefix}' in tab '{tab}'")
-                resolve_downstream_placeholders(sheets_service, spreadsheet_id, tab, values, prefix, result)
+                queue_downstream_placeholder_writes(pending_writes, tab, values, prefix, result)
             except Exception as e:
                 print(f"Error computing tiebreaker for pool '{prefix}': {e}")
+
+    if pending_writes:
+        sheets_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "RAW", "data": pending_writes}
+        ).execute()
 
 
 # ============================================================================
@@ -612,42 +703,60 @@ def run_tiebreaker_for_spreadsheet(sheets_service, spreadsheet_id):
 # ============================================================================
 def watch(config, drive_service, sheets_service):
     excel_file = config["excel"]
-    live_copy_path = config["live_copy"]
     sheet_name = config["sheet"]
 
     def apply_auto_advance():
-        # Try live in-place first (xlwings, talks directly to your open
-        # Excel session). Falls back to the Sheets + duplicate-file path
-        # if xlwings isn't installed or the file isn't currently open.
-        live_ok = run_tiebreaker_live_xw(excel_file)
+        print(f"Change detected in {os.path.basename(excel_file)}!")
 
-        # Upload either way, so Google Sheets stays in sync with whatever
-        # just happened locally.
         file_id = upload_to_drive(drive_service, excel_file, sheet_name, config["count"])
         if file_id:
             run_tiebreaker_for_spreadsheet(sheets_service, file_id)
-            if not live_ok:
-                download_sheet_as_excel(drive_service, file_id, live_copy_path)
+
+        # Live in-place edit directly in your open Excel session. Runs
+        # independently of the Sheets computation above -- if this fails
+        # (xlwings missing, Excel not currently open with this file), the
+        # Sheets side above already ran fine on its own; only your local
+        # file misses the live edit until this succeeds on a later save.
+        run_tiebreaker_live_xw(excel_file)
+
+        print("FINISHED")
+        print("-" * 40)
         return file_id
 
     config["count"] += 1
     apply_auto_advance()
 
-    # xlwings' wb.save() just touched excel_file's mtime -- read it fresh
-    # AFTER that save, so we don't mistake our own edit for a new change
+    # Two-stage gate, so this only actually runs when you deliberately save
+    # (Ctrl+S / Save button), not on every live in-memory keystroke:
+    #
+    # 1. mtime gate: os.path.getmtime() only changes when Excel actually
+    #    WRITES the file to disk -- i.e. on a save. It does NOT change just
+    #    because a cell was edited in memory. This is the "did a save just
+    #    happen at all" check.
+    #
+    # 2. data-signature gate: even a real save can happen with zero actual
+    #    score changes (e.g. Excel's own AutoSave firing on a timer, or you
+    #    saving without having changed anything). compute_data_signature
+    #    hashes the actual game data (not file bytes/metadata), so a save
+    #    with no real content change doesn't trigger a wasted auto-advance
+    #    cycle either.
+    #
+    # Both are read AFTER apply_auto_advance(), since our own live writes
+    # (resolved placeholders, Standings tab) just changed both -- otherwise
+    # we'd immediately mistake our own edit for a new user save.
     last_modified = os.path.getmtime(excel_file)
+    last_signature = compute_data_signature(excel_file)
 
     while True:
         time.sleep(2)
         try:
             current_modified = os.path.getmtime(excel_file)
             if current_modified != last_modified:
-                config["count"] += 1
-                apply_auto_advance()
-
-                # same reasoning: our own save just changed mtime again --
-                # re-read it after the fact, not before, so the next poll
-                # compares against the post-save state, not the pre-save one
+                current_signature = compute_data_signature(excel_file)
+                if current_signature != last_signature:
+                    config["count"] += 1
+                    apply_auto_advance()
+                    last_signature = compute_data_signature(excel_file)
                 last_modified = os.path.getmtime(excel_file)
         except Exception as e:
             print(f"Error watching {os.path.basename(excel_file)}: {e}")
